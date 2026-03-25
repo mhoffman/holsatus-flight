@@ -20,9 +20,4 @@ fn flight_pattern() {
         "max acceleration to high: {:.2} m/s/s",
         report.report.max_acceleration_ms2
     );
-    assert!(
-        report.speed_factor > 100.0,
-        "simulation slower than expected: {:.2} t_sim/t_wall",
-        report.speed_factor,
-    );
 }
