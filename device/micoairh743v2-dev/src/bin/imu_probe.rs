@@ -1,0 +1,89 @@
+//! MicoAir H743v2 -- SPI IMU chip-ID probe.
+//!
+//! Reads the CHIP_ID register from both BMI088 CS pins on SPI2 and prints the
+//! results over UART1.  Use this to confirm the IMU is correctly wired.
+//!
+//! Expected results:
+//!   BMI088 accel CS=PD4  -> chip_id=0x1E  (or 0x1A for BMI088_MM, 0x1F for BMI085)
+//!   BMI088 gyro  CS=PD5  -> chip_id=0x0F
+//!
+//! 0xFF means nothing responds on that CS (MISO floating high due to Pull::Up).
+//!
+//! Hardware:
+//!   SPI2: SCLK=PD3  MOSI=PC3  MISO=PC2
+//!   UART1 TX=PA9  (115 200 baud)
+
+#![no_std]
+#![no_main]
+
+use core::fmt::Write;
+
+use embassy_executor::Spawner;
+use embassy_stm32::gpio::{Level, Output, Pull, Speed};
+use embassy_stm32::spi::{self, Config as SpiConfig, Spi};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::usart::{Config as UartConfig, UartTx};
+use embassy_time::Timer;
+use embedded_hal_async::spi::SpiDevice;
+use heapless::String;
+use micoairh743v2::resources::Spi2Irqs;
+use micoairh743v2::resources::UartLogIrqs;
+use static_cell::StaticCell;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::mutex::Mutex;
+use embassy_stm32::mode::Async;
+use embassy_stm32::spi::mode::Master;
+use embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig;
+use {defmt_rtt as _, panic_probe as _};
+
+
+type Spi2Bus = Mutex<NoopRawMutex, Spi<'static, Async, Master>>;
+static SPI2_BUS: StaticCell<Spi2Bus> = StaticCell::new();
+
+/// Read register 0x00 (CHIP_ID) using the standard Bosch SPI read protocol:
+/// assert CS, send [0x80, 0x00, 0x00], deassert CS, data is in byte[2].
+async fn read_chip_id(dev: &mut impl SpiDevice) -> u8 {
+    let mut buf = [0x80u8, 0x00, 0x00];
+    dev.transfer_in_place(&mut buf).await.ok();
+    buf[2]
+}
+
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let p = embassy_stm32::init(micoairh743v2::config::embassy_config());
+
+    let mut uart = UartTx::new(
+        p.USART1, p.PA9, p.DMA1_CH0, UartLogIrqs, UartConfig::default(),
+    ).unwrap();
+    uart.write(b"imu_probe: start\r\n").await.ok();
+
+    let mut spi_cfg = SpiConfig::default();
+    spi_cfg.frequency = Hertz(1_000_000); // slow for probe
+    spi_cfg.mode = spi::MODE_3;
+    spi_cfg.miso_pull = Pull::Up;
+
+    let spi = Spi::new(
+        p.SPI2, p.PD3, p.PC3, p.PC2,
+        p.DMA1_CH6, p.DMA1_CH7,
+        Spi2Irqs, spi_cfg,
+    );
+    let bus = SPI2_BUS.init(Mutex::new(spi));
+
+    let mut cs_pd4 = Output::new(p.PD4, Level::High, Speed::High);
+    let mut cs_pd5 = Output::new(p.PD5, Level::High, Speed::High);
+
+    Timer::after_millis(10).await;
+
+    for (label, id) in [
+        ("BMI088A PD4", { let mut d = SpiDeviceWithConfig::new(bus, &mut cs_pd4, spi_cfg); read_chip_id(&mut d).await }),
+        ("BMI088G PD5", { let mut d = SpiDeviceWithConfig::new(bus, &mut cs_pd5, spi_cfg); read_chip_id(&mut d).await }),
+    ] {
+        let mut s: String<48> = String::new();
+        write!(s, "imu_probe: {} chip_id=0x{:02X}\r\n", label, id).ok();
+        uart.write(s.as_bytes()).await.ok();
+        Timer::after_millis(5).await;
+    }
+
+    uart.write(b"imu_probe: done\r\n").await.ok();
+    loop { Timer::after_secs(60).await; }
+}

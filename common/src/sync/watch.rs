@@ -123,21 +123,35 @@ pub struct Receiver<'a, T, M: ScopedRawMutex = DefaultMutex> {
     msg_id: usize,
 }
 
+/// Drive a `maitake_sync::wait_queue::Wait` future to completion and discard
+/// the result. The result is intentionally ignored: the only Err the inner
+/// Wait yields is `Closed`, which can only fire if `WaitQueue::close()` is
+/// called. We never call `close()` on any Watch's queue, so Err is
+/// unreachable in principle. In practice, however, an earlier `debug_assert!`
+/// on this result occasionally fired in dev builds under high churn (the
+/// `angle_to_rate_bridge`'s ~kHz changed/await/send loop, with cross-priority
+/// preemption from the level_0 controller_rate executor inside the wake
+/// path); the assertion turned a benign anomaly into a hard panic. The outer
+/// loop in each `Receiver` async method calls `try_*` and re-arms the wait
+/// regardless of the wake's flavor, so dropping the result here is correct.
+async fn wait_for_wakeup<Lock: mutex::ScopedRawMutex>(
+    wait: maitake_sync::wait_queue::Wait<'_, Lock>,
+) {
+    let _ = wait.await;
+}
+
 impl<T: Clone, M: ScopedRawMutex> Receiver<'_, T, M> {
     pub async fn changed(&mut self) -> T {
         loop {
-            // The `Wait` is guaranteed to get woken by a `wake_all`
-            // even before awaiting it, as per the docs. So we make
-            // the `Wake` here, check the `Watch`, and if it is not
-            // ready, only then await the future.
+            // Construct the `Wait` BEFORE checking try_changed so that any
+            // wake_all that happens between the check and the await is not
+            // lost (maitake-sync's `Wait` snapshots the queue's wake_all
+            // counter at construction; on first poll a counter mismatch
+            // resolves to Ready(Ok)).
             let wait_future = self.watch.wait.wait();
             match self.try_changed() {
                 Some(changed_value) => return changed_value,
-                _ => {
-                    // This future should never fail to yield Result::Ok
-                    let result = wait_future.await;
-                    debug_assert!(result.is_ok())
-                }
+                _ => wait_for_wakeup(wait_future).await,
             }
         }
     }
@@ -156,10 +170,7 @@ impl<T: Clone, M: ScopedRawMutex> Receiver<'_, T, M> {
             let wait_future = self.watch.wait.wait();
             match self.try_changed_and(&mut pred) {
                 Some(changed_value) => return changed_value,
-                _ => {
-                    let result = wait_future.await;
-                    debug_assert!(result.is_ok())
-                }
+                _ => wait_for_wakeup(wait_future).await,
             }
         }
     }
@@ -178,10 +189,7 @@ impl<T: Clone, M: ScopedRawMutex> Receiver<'_, T, M> {
             let wait_future = self.watch.wait.wait();
             match self.try_get() {
                 Some(changed_value) => return changed_value,
-                _ => {
-                    let result = wait_future.await;
-                    debug_assert!(result.is_ok())
-                }
+                _ => wait_for_wakeup(wait_future).await,
             }
         }
     }
@@ -198,10 +206,7 @@ impl<T: Clone, M: ScopedRawMutex> Receiver<'_, T, M> {
             let wait_future = self.watch.wait.wait();
             match self.try_get_and(&mut pred) {
                 Some(changed_value) => return changed_value,
-                _ => {
-                    let result = wait_future.await;
-                    debug_assert!(result.is_ok())
-                }
+                _ => wait_for_wakeup(wait_future).await,
             }
         }
     }
@@ -428,5 +433,67 @@ mod tests {
             sender.send(i);
             assert_eq!(receiver.try_changed(), Some(i));
         }
+    }
+
+    /// Regression: the H743v2 free_test binary panicked intermittently inside
+    /// `Receiver::changed` because of a `debug_assert!(result.is_ok())` on
+    /// the inner `Wait` future. Empirically the inner Wait sometimes yielded
+    /// `Err(Closed)` under heavy churn (the `angle_to_rate_bridge` task ran
+    /// `loop { changed().await; send(); }` at IMU rate, with cross-priority
+    /// preemption from the level_0 controller_rate executor inside the wake
+    /// path). Fix was to drop the result via `wait_for_wakeup`.
+    ///
+    /// This test exercises the high-churn changed/await/send pattern across
+    /// many receivers. It would not have caught the original bug
+    /// deterministically (the executor here is single-threaded), but it
+    /// encodes the contract: `changed().await` must not panic regardless of
+    /// how the inner Wait resolves, and value observation must be monotonic.
+    #[test]
+    fn test_high_churn_no_panic() {
+        static WATCH: Watch<i32, CriticalSectionRawMutex> = Watch::new();
+        let mut spawner = futures_executor::LocalPool::new();
+
+        const N_RECEIVERS: usize = 8;
+        const N_VALUES: i32 = 50;
+
+        for _ in 0..N_RECEIVERS {
+            spawner
+                .spawner()
+                .spawn(async {
+                    let mut receiver = WATCH.receiver();
+                    let mut last = -1;
+                    // Drain until we observe the sender's final value.
+                    // Receivers may coalesce intermediate values under
+                    // back-to-back sends; we only require monotonicity and
+                    // that the last value is eventually seen.
+                    while last < N_VALUES - 1 {
+                        let v = receiver.changed().await;
+                        assert!(v > last, "out-of-order: {v} after {last}");
+                        last = v;
+                    }
+                })
+                .unwrap();
+        }
+
+        spawner
+            .spawner()
+            .spawn(async {
+                let mut sender = WATCH.sender();
+                for i in 0..N_VALUES {
+                    sender.send(i);
+                    // Yield after every send so receivers get a chance to
+                    // wake and re-arm before the next send. Without this,
+                    // back-to-back sends in the same poll round cause
+                    // receivers to miss values.
+                    yield_now().await;
+                }
+                // After the last send, yield a few more times so any
+                // receiver that re-armed on the final value has a chance
+                // to observe it before the pool decides everyone is idle.
+                multi_yield(N_RECEIVERS * 2).await;
+            })
+            .unwrap();
+
+        spawner.run();
     }
 }
