@@ -76,6 +76,70 @@ All three runbook tests (static, tilt, dynamic) pass their stated pass/fail crit
 1. **Lockstep wall-clock timing is not representative of real-hardware timing.** Every fixed-`dt` task effectively runs at whatever rate the host delivers frames (~176-180 Hz observed here, not the assumed 1000 Hz), so anything time-constant-dependent (AHRS beta correction, PID integration, etc.) will appear to happen ~5-6x slower in wall-clock terms than on real flight hardware. This matches the plan's own framing — lockstep phases are for sample-domain correctness, not timing evidence (that's explicitly Phase 4's job).
 2. **Two intermittent, unexplained cross-axis anomalies** (a one-off ~60° yaw jump between tilt reconnects; a ~15° pitch excursion at the tilt→dynamic mode transition) — both transient, both self-correcting, neither blocking the pass/fail calls above, but both worth a closer look before leaning on this rig for anything beyond single-axis sanity checks. Possibly related to the non-standard step of rotating the output Euler-angle triple as if it were a raw vector, or to reconnect-time framing artifacts — unconfirmed either way.
 
+---
+
+# Phase 2 HIL Test Result — H743v2 (faithful motor tap)
+
+Date: 2026-07-14
+Firmware: `HilMotors` implements `OutputGroup`; `motor_governor::main` runs unmodified in HIL mode (real arming state machine, thrust linearizer, disarm-timeout). `AttitudeFrame` grew to 33 bytes carrying `motors: [u16;4]` and a 3-bit `MOTORS_STATE` code packed into the previously-unused flags bits (`encode_motor_state`).
+
+## Setup: HIL-only auto-arm debug hook
+
+Without RC injection, `motor_governor`'s disarmed loop never calls any `OutputGroup` method at all (confirmed by reading `motor_governor.rs:113-118` directly), so a flat `[0,0,0,0]` motors reading is indistinguishable between "correctly wired, disarmed" and "silently broken". Added `hil_auto_arm_task`: waits for `CAL_DONE` + 200ms, then force-sends `COMMAD_ARM_VEHICLE=true` once. Confirmed safe before adding it: `mission_fsm_task` always blocks on `RC_LINK_READY` (30s timeout into a permanent abort loop) before it ever reaches its own arm/disarm calls, and HIL injects no RC, so there is no competing writer to fight. Temporary — delete once real RC injection exists and can arm through the real path.
+
+## Test 1: Motor state visibility — needed, not optional
+
+First attempt (`dynamic --roll-rate 15`, ~860°/s) showed motors flat at `[0,0,0,0]` for the full 15s run despite the aggressive injected rate. Inconclusive on its own — a `motors==[0,0,0,0]` reading alone can't distinguish "never armed" from "armed, mixer genuinely at zero", a limitation flagged before this run and confirmed to matter in practice. Added the `MOTORS_STATE` tap specifically to resolve this ambiguity rather than guess further.
+
+## Test 2: Gyro-runaway safety kill — PASS (real safety system correctly triggered)
+
+Rerunning the same `dynamic --roll-rate 15` with motor-state visibility showed the full story:
+
+```
+t=0.23s motor_state: disarmed:uninit -> arming
+  (arming burst runs its full ~2.24s course; motors stay [0,0,0,0] throughout
+   by design -- min-throttle/reverse-dir bursts, not final speed commands)
+t=2.47s motor_state: arming -> disarmed:user
+```
+
+Root cause: `gyro_runaway_kill` (`flight.rs:2641-2680`) monitors `RAW_MULTI_IMU_DATA` continuously, independent of arm state, and permanently force-disarms + latches `MOTOR_KILL` if any gyro axis exceeds `GYRO_RUNAWAY_THRESHOLD=5.0 rad/s` for `GYRO_RUNAWAY_COUNT=50` consecutive samples (~280ms at the observed ~176 Hz link rate). The injected 15 rad/s is ~3x that threshold, so it tripped almost immediately. `motor_governor` doesn't distinguish *who* sent `COMMAD_ARM_VEHICLE=false` — both a real user command and this safety kill show up as the same generic `DisarmReason::UserCommand` ("disarmed:user"), which is why the label doesn't say "kill" even though the real cause was the safety task, not a user.
+
+Timing note: the kill signal is sent almost immediately (~0.3-0.5s in) but doesn't visibly take effect until t=2.47s, because `motor_governor`'s arming sub-loop (25x min-throttle + 15x reverse-dir bursts, `motor_governor.rs:144-154`) doesn't re-check the arm signal at all until it finishes and enters the main armed-loop `select()` — the disarm is queued the whole time but only observed once the burst completes.
+
+This is a pure software threshold (constants in `flight.rs`), evaluated identically in HIL and real flight — not a HIL-specific limitation, and well below the sensor's real measurable range (`controller_rate.rs`'s own `MAX_GYR_MEAS ≈ 33.3 rad/s`). Confirms the real safety pipeline is alive and correctly wired through HIL. `MOTOR_KILL` latches permanently for the rest of the boot session by design (unrecoverable without a power cycle) — needed a reflash/power-cycle before the next test.
+
+## Test 3: Sustained armed motor response — PASS (first genuine non-trivial motor output)
+
+After a power cycle, rerunning with a realistic `dynamic --roll-rate 0.5` (well under the 5 rad/s kill threshold):
+
+```
+t=2.47s motor_state: arming -> armed
+t=2.64s motors=[634, 634, 147, 147]
+...
+t=4.85s motors=[847, 847, 147, 147]
+```
+
+- motor0/motor1 climb together from 634 to 847 over ~2.2s; motor2/motor3 sit flat at 147 (the governor's configured `out_min` floor) throughout.
+- This is the **full angle -> rate -> mixer cascade**, not just the rate loop: `MANUAL_BYPASS` defaults to `false` (`alt_hold.rs:28`) and nothing in HIL mode ever sets it (the FSM, which normally controls it via the flight-mode switch, never reaches its main loop). So `angle_to_rate_bridge` is never bypassed: `controller_angle` compares the (growing, injected) roll against `TRUE_ATTITUDE_Q_SP`, frozen at level/identity since nothing updates it, producing a growing angle-error correction that feeds `TRUE_RATE_SP` and on through `controller_rate`'s mixer.
+- The steady climb (rather than settling to a constant) is expected given today's setup: `dynamic` mode injects a fixed, open-loop 0.5 rad/s regardless of motor output — there is no physics feedback yet (that's `phase2_hil.py`'s job), so the simulated attitude just keeps drifting further from the frozen setpoint and the correction keeps growing with it. motor2/3 floor at `out_min` rather than going negative, consistent with a quad-X roll mixer (increase two motors, decrease the other two, clamped at the real minimum command value).
+- Confirms the faithful motor tap works end-to-end: real governor, real arming sequence, real mixer output, all observable over the HIL link with zero ambiguity now that `motor_state` is exposed alongside `motors`.
+
+## Test 4: Boundary verification of the gyro-runaway kill threshold — PASS (clean black-box test of a safety-critical path)
+
+```
+python3 tools/hil_phase1_imu_inject.py /dev/cu.usbserial-A5069RR4 dynamic --roll-rate 4.9 --duration 5
+# power-cycled between runs -- the 5.1 run's kill permanently latches MOTOR_KILL for the rest of that boot session
+python3 tools/hil_phase1_imu_inject.py /dev/cu.usbserial-A5069RR4 dynamic --roll-rate 5.1 --duration 5
+```
+
+- **4.9 rad/s** (just under `GYRO_RUNAWAY_THRESHOLD=5.0`): armed at t=2.46s and **stayed armed for the full remaining ~2.5s** of the test — no kill. Also produced a clean demonstration of the controller's quaternion-based shortest-path error handling: as the open-loop injected roll crossed 180°, motor pair (0,1) fell from full-scale 2047 back to the `out_min` floor while motor pair (2,3) ramped up to take over — matching exactly what `controller_angle.rs:83-91`'s `q_error = q_attitude.inverse() * q_setpoint; axis_error = q_error.scaled_axis()` predicts. `scaled_axis()` on a unit quaternion always extracts a rotation of at most 180°, so the "shortest path back to level" flips direction the instant the physical rotation passes the antipodal point, and the motor pairs swap right along with it (with a fraction-of-a-second lag from PID/filter dynamics, not a bug).
+- **5.1 rad/s** (just over threshold): armed at t=0.20s, then **disarmed at t=2.44s** with `motor_state=disarmed:user` (the generic label `gyro_runaway_kill` produces, per the Test 2 root cause) — stayed disarmed for the rest of the run, motors held at `[0,0,0,0]`.
+- The two runs bracket `GYRO_RUNAWAY_THRESHOLD=5.0 rad/s` with only a 0.1 rad/s margin on each side and produce cleanly opposite outcomes (sustained-armed vs. permanent-kill), fully observable over the HIL link via `motor_state` alone — no oscilloscope, no BT log, no probe needed. This is a genuinely useful **black-box verification pattern for a safety-critical threshold**: inject a synthetic gyro rate straddling the documented limit and confirm the kill fires exactly where it should, entirely through the same lockstep IMU-injection path used for the rest of Phase 1/2. Generalizes directly to other safety thresholds in this firmware (e.g. `flip_kill`) once/if they're worth the same treatment.
+
+## Phase 2 summary (partial — tap verified, RC injection still pending)
+
+The faithful `HilMotors` tap and the `MOTORS_STATE` visibility fix are both confirmed working end-to-end, including exercising a real safety path (gyro-runaway kill) faithfully through HIL, and bracketing its exact threshold with a clean pass/fail pair (4.9 vs 5.1 rad/s). For future testing: keep `--roll-rate` comfortably under 5 rad/s (or reasonable `--roll-deg` tilt magnitudes) unless deliberately testing the gyro-runaway kill path; a full power cycle is required to recover from that kill latch, since it and the one-shot auto-arm hook are both spent after firing once. Next real step per the original plan: RC injection, both to arm through the real path (retiring `hil_auto_arm_task`) and to provide a nonzero `TRUE_Z_THRUST_SP` so a genuine bounded-hover test becomes possible instead of an unbounded angle-error climb.
+
 ## Follow-on idea (not started): real-flight-log replay for sim2real gap
 
 Once tilt/dynamic close out Phase 1's synthetic-profile pass/fail, a natural extension is to replay gyro/accel from a real Betaflight blackbox log (decoded via `/Users/maxjh/src/blackbox-tools/obj/blackbox_decode --simulate-imu`) through the same `SensorFrame` protocol instead of the static/tilt/dynamic synthetic profiles. That drives the estimator with real IMU vibration/noise spectra on actual silicon and gives a direct sim2real comparison point against `holsatus-sim`, rather than only clean synthetic inputs.
