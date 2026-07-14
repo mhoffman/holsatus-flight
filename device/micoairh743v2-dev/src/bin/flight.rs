@@ -512,7 +512,7 @@ use common::tasks::controller_angle;
 use common::tasks::controller_rate;
 use common::tasks::eskf::EskfEstimate;
 use common::tasks::motor_governor;
-use common::types::actuators::MotorsState;
+use common::types::actuators::{DisarmReason, MotorsState};
 use common::types::config::DshotConfig;
 use common::types::measurements::Imu6DofData;
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -3324,18 +3324,40 @@ const SENSOR_FRAME_TYPE: u8 = 0x01;
 ///                              estimate -- a host waiting to inject a
 ///                              non-level test profile should poll this
 ///                              instead of guessing a fixed warm-up duration.
+///                              bits[3:1] = MOTORS_STATE, see
+///                              encode_motor_state -- lets a host tell "never
+///                              armed" apart from "armed but genuinely
+///                              computing zero", which a motors==[0,0,0,0]
+///                              reading alone cannot (see motors field below).
 ///   [23..31)  motors: u16x4 -- Phase 2: latest motor_governor::main output via
 ///                              HilMotors::set_motor_speeds, in motor-index
 ///                              order. Zero (not the real DShot idle value)
 ///                              until the governor's first call this boot --
 ///                              indistinguishable from a genuine disarmed/
-///                              zero command, same caveat as the CAL_DONE
-///                              flag above for q.
+///                              zero command; check the flags byte's motor
+///                              state bits instead of inferring from this.
 ///   [31..33)  crc16 : u16   -- CRC-16/CCITT-FALSE over bytes [0..31)
 const ATTITUDE_FRAME_LEN: usize = 33;
 const ATTITUDE_FRAME_SYNC: u8 = 0x5A;
 const ATTITUDE_FRAME_TYPE: u8 = 0x02;
 const ATTITUDE_FLAG_CAL_DONE: u8 = 1 << 0;
+
+/// Packs MotorsState into 3 bits (0-7, one code per variant) for the
+/// AttitudeFrame flags byte. See the frame layout doc above for why this
+/// exists: motors==[0,0,0,0] alone can't tell "never armed" apart from
+/// "armed, mixer genuinely at zero".
+fn encode_motor_state(state: MotorsState) -> u8 {
+    match state {
+        MotorsState::Disarmed(DisarmReason::Uninitialized) => 0,
+        MotorsState::Disarmed(DisarmReason::ArmingBlocker) => 1,
+        MotorsState::Disarmed(DisarmReason::UserCommand) => 2,
+        MotorsState::Disarmed(DisarmReason::Killswitch) => 3,
+        MotorsState::Disarmed(DisarmReason::Timeout) => 4,
+        MotorsState::Arming => 5,
+        MotorsState::ArmedIdle => 6,
+        MotorsState::Armed(_) => 7,
+    }
+}
 
 /// CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF). Matches the Python host's
 /// crcmod/manual implementation -- see phase1_imu_inject.py.
@@ -3382,6 +3404,7 @@ fn encode_attitude_frame(
     seq: u32,
     q: &UnitQuaternion<f32>,
     cal_done: bool,
+    motor_state: u8,
     motors: [u16; 4],
 ) -> [u8; ATTITUDE_FRAME_LEN] {
     let mut buf = [0u8; ATTITUDE_FRAME_LEN];
@@ -3393,7 +3416,7 @@ fn encode_attitude_frame(
     buf[10..14].copy_from_slice(&c[1].to_le_bytes());
     buf[14..18].copy_from_slice(&c[2].to_le_bytes());
     buf[18..22].copy_from_slice(&c[3].to_le_bytes());
-    buf[22] = if cal_done { ATTITUDE_FLAG_CAL_DONE } else { 0 };
+    buf[22] = (if cal_done { ATTITUDE_FLAG_CAL_DONE } else { 0 }) | (motor_state << 1);
     for i in 0..4 {
         buf[23 + i * 2..25 + i * 2].copy_from_slice(&motors[i].to_le_bytes());
     }
@@ -3509,6 +3532,7 @@ async fn hil_link_task(r: UartLogResources) -> ! {
     let snd_imu = HIL_IMU_CHAN.sender();
     let mut att_rcv = signals::AHRS_ATTITUDE_Q.receiver();
     let mut motor_rcv = HIL_MOTOR_SPEEDS.receiver();
+    let mut motor_state_rcv = signals::MOTORS_STATE.receiver();
 
     let mut buf = [0u8; SENSOR_FRAME_LEN];
     loop {
@@ -3533,7 +3557,8 @@ async fn hil_link_task(r: UartLogResources) -> ! {
         let q = att_rcv.try_get().unwrap_or(UnitQuaternion::identity());
         let cal_done = micoairh743v2::imu_cal::CAL_DONE.load(core::sync::atomic::Ordering::Relaxed);
         let motors = motor_rcv.try_get().unwrap_or([0u16; 4]);
-        let out = encode_attitude_frame(frame.seq, &q, cal_done, motors);
+        let motor_state = motor_state_rcv.try_get().map(encode_motor_state).unwrap_or(0);
+        let out = encode_attitude_frame(frame.seq, &q, cal_done, motor_state, motors);
         tx.write(&out).await.ok();
     }
 }

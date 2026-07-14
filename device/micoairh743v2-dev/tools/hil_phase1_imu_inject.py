@@ -16,10 +16,13 @@ automatically when the FC boots on USB power):
     u16 motors[4], u16 crc16
     flags bit0 = imu_cal::CAL_DONE. Before it's set, q is hil_link_task's
     identity fallback (att_estimator isn't spawned yet), not a real estimate.
+    flags bits[3:1] = MOTORS_STATE (see MOTOR_STATE_NAMES) -- lets a host
+    tell "never armed" apart from "armed but genuinely computing zero",
+    which the motors field alone cannot.
     motors = Phase 2: latest motor_governor::main output via HilMotors, in
     motor-index order. Zero before the governor's first call this boot --
-    indistinguishable from a genuine disarmed/zero command, same caveat as
-    the CAL_DONE flag above for q.
+    indistinguishable from a genuine disarmed/zero command; check
+    motor_state instead of inferring from this field.
 
 CRC is CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over all preceding
 bytes in the frame -- matches flight.rs::crc16_ccitt exactly.
@@ -52,6 +55,12 @@ ATTITUDE_FRAME_LEN = 33
 ATTITUDE_FRAME_SYNC = 0x5A
 ATTITUDE_FRAME_TYPE = 0x02
 ATTITUDE_FLAG_CAL_DONE = 1 << 0
+# Mirrors flight.rs::encode_motor_state -- one code per MotorsState/DisarmReason
+# variant, packed into flags bits[3:1].
+MOTOR_STATE_NAMES = [
+    "disarmed:uninit", "disarmed:blocker", "disarmed:user", "disarmed:kill",
+    "disarmed:timeout", "arming", "armed_idle", "armed",
+]
 GRAVITY = 9.81
 
 
@@ -85,6 +94,7 @@ def parse_attitude_frame(buf: bytes):
         "seq": seq,
         "quat_ijkw": (i, j, k, w),
         "cal_done": bool(flags & ATTITUDE_FLAG_CAL_DONE),
+        "motor_state": MOTOR_STATE_NAMES[(flags >> 1) & 0b111],
         "motors": (m0, m1, m2, m3),
     }
 
@@ -175,11 +185,12 @@ def record_sample(samples: list, phase: str, t_global: float, att) -> None:
     if att is None:
         samples.append({"phase": phase, "t": t_global, "roll": math.nan,
                          "pitch": math.nan, "yaw": math.nan, "cal_done": None,
-                         "motors": (math.nan,) * 4, "missing": True})
+                         "motor_state": None, "motors": (math.nan,) * 4, "missing": True})
         return
     r, p, y = quat_to_euler_deg(*att["quat_ijkw"])
     samples.append({"phase": phase, "t": t_global, "roll": r, "pitch": p,
                      "yaw": y, "cal_done": att["cal_done"],
+                     "motor_state": att["motor_state"],
                      "motors": att["motors"], "missing": False})
 
 
@@ -215,6 +226,7 @@ def run(ser, acc_fn, gyr_fn, duration_s: float, label: str, t0_global: float, sa
     t0 = time.perf_counter()
     seq = 0
     last_print = 0.0
+    last_motor_state = None
     n_bad = 0
     reader = AttitudeFrameReader()
     while time.perf_counter() - t0 < duration_s:
@@ -224,13 +236,23 @@ def run(ser, acc_fn, gyr_fn, duration_s: float, label: str, t0_global: float, sa
         record_sample(samples, "run", time.perf_counter() - t0_global, att)
         if att is None:
             n_bad += 1
-        elif t - last_print > 0.2:
-            last_print = t
-            r, p, y = quat_to_euler_deg(*att["quat_ijkw"])
-            cal = "Y" if att["cal_done"] else "N"
-            m = att["motors"]
-            print(f"t={t:5.2f}s seq={seq:6d} cal={cal} roll={r:6.2f} pitch={p:6.2f} yaw={y:6.2f} "
-                  f"motors=[{m[0]:4d},{m[1]:4d},{m[2]:4d},{m[3]:4d}]")
+        else:
+            # Print immediately on any motor_state change (e.g. disarmed ->
+            # arming -> armed_idle -> armed) regardless of the 0.2s throttle
+            # below -- this is the signal that actually answers "did the
+            # governor ever leave disarmed", which a periodic motors=[...]
+            # snapshot alone can't (see MOTOR_STATE_NAMES / encode_motor_state).
+            if att["motor_state"] != last_motor_state:
+                print(f"t={t:5.2f}s seq={seq:6d} motor_state: "
+                      f"{last_motor_state} -> {att['motor_state']}")
+                last_motor_state = att["motor_state"]
+            if t - last_print > 0.2:
+                last_print = t
+                r, p, y = quat_to_euler_deg(*att["quat_ijkw"])
+                cal = "Y" if att["cal_done"] else "N"
+                m = att["motors"]
+                print(f"t={t:5.2f}s seq={seq:6d} cal={cal} roll={r:6.2f} pitch={p:6.2f} yaw={y:6.2f} "
+                      f"motor_state={att['motor_state']:12s} motors=[{m[0]:4d},{m[1]:4d},{m[2]:4d},{m[3]:4d}]")
         seq += 1
     print(f"done: {seq} sent, {n_bad} bad/missing replies\n")
 
