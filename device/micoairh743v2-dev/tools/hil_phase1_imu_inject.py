@@ -33,7 +33,9 @@ Usage:
 """
 import argparse
 import math
+import os
 import struct
+import subprocess
 import time
 
 BAUD = 115_200  # only rate with a genuine matched-baud Phase 0 measurement;
@@ -159,7 +161,22 @@ def quat_to_euler_deg(i, j, k, w):
     return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 
-def wait_for_calibration(ser, max_wait_s: float) -> bool:
+def record_sample(samples: list, phase: str, t_global: float, att) -> None:
+    """Append one plot sample. `att is None` marks a missing/bad reply --
+    kept in the series (as NaN angles) so the plot can mark it, rather than
+    silently dropping the timestamp.
+    """
+    if att is None:
+        samples.append({"phase": phase, "t": t_global, "roll": math.nan,
+                         "pitch": math.nan, "yaw": math.nan, "cal_done": None,
+                         "missing": True})
+        return
+    r, p, y = quat_to_euler_deg(*att["quat_ijkw"])
+    samples.append({"phase": phase, "t": t_global, "roll": r, "pitch": p,
+                     "yaw": y, "cal_done": att["cal_done"], "missing": False})
+
+
+def wait_for_calibration(ser, max_wait_s: float, t0_global: float, samples: list) -> bool:
     """Stream level/stationary data until the firmware reports CAL_DONE.
 
     Returns True once confirmed, False if max_wait_s elapses first (in
@@ -179,13 +196,14 @@ def wait_for_calibration(ser, max_wait_s: float) -> bool:
             return False
         ser.write(build_sensor_frame(seq, (0.0, 0.0, -GRAVITY), (0.0, 0.0, 0.0)))
         att = reader.read(ser, ser.timeout)
+        record_sample(samples, "warmup", time.perf_counter() - t0_global, att)
         if att is not None and att["cal_done"]:
             print(f"calibration confirmed done at t={t:.2f}s (seq={seq})\n")
             return True
         seq += 1
 
 
-def run(ser, acc_fn, gyr_fn, duration_s: float, label: str):
+def run(ser, acc_fn, gyr_fn, duration_s: float, label: str, t0_global: float, samples: list):
     print(f"-- {label} ({duration_s:.1f}s) --")
     t0 = time.perf_counter()
     seq = 0
@@ -196,6 +214,7 @@ def run(ser, acc_fn, gyr_fn, duration_s: float, label: str):
         t = time.perf_counter() - t0
         ser.write(build_sensor_frame(seq, acc_fn(t), gyr_fn(t)))
         att = reader.read(ser, ser.timeout)
+        record_sample(samples, "run", time.perf_counter() - t0_global, att)
         if att is None:
             n_bad += 1
         elif t - last_print > 0.2:
@@ -205,6 +224,53 @@ def run(ser, acc_fn, gyr_fn, duration_s: float, label: str):
             print(f"t={t:5.2f}s seq={seq:6d} cal={cal} roll={r:6.2f} pitch={p:6.2f} yaw={y:6.2f}")
         seq += 1
     print(f"done: {seq} sent, {n_bad} bad/missing replies\n")
+
+
+def plot_samples(args, samples: list) -> str:
+    """Render roll/pitch/yaw vs. time (warm-up + test phase) to a single PNG
+    and return the output path. Missing/bad replies are marked rather than
+    dropped, so a stretch of bad frames is visible instead of just making
+    the line jump.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ts = [s["t"] for s in samples]
+    fig, ax = plt.subplots(figsize=(11, 6), dpi=150)
+    ax.plot(ts, [s["roll"] for s in samples], color="#2a78d6", linewidth=1.5, label="roll")
+    ax.plot(ts, [s["pitch"] for s in samples], color="#1baf7a", linewidth=1.5, label="pitch")
+    ax.plot(ts, [s["yaw"] for s in samples], color="#eda100", linewidth=1.5, label="yaw")
+
+    warmup_ts = [s["t"] for s in samples if s["phase"] == "warmup"]
+    if warmup_ts:
+        boundary = max(warmup_ts)
+        ax.axvline(boundary, color="#898781", linestyle="--", linewidth=1)
+        ax.text(boundary, 1.0, "run start", transform=ax.get_xaxis_transform(),
+                va="bottom", ha="left", fontsize=8, color="#52514e")
+
+    bad_ts = [s["t"] for s in samples if s["missing"]]
+    if bad_ts:
+        ax.plot(bad_ts, [0.0] * len(bad_ts), transform=ax.get_xaxis_transform(),
+                marker="|", markersize=10, linestyle="none", color="#e34948",
+                label="missing reply", clip_on=False)
+
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("angle (deg)")
+    ax.grid(True, color="#e1e0d9", linewidth=0.5)
+    ax.legend(loc="upper right", frameon=False)
+
+    arg_str = "  ".join(f"{k}={v}" for k, v in vars(args).items())
+    fig.suptitle(f"HIL Phase 1 IMU inject -- {args.mode}", fontsize=13, fontweight="bold")
+    ax.set_title(arg_str, fontsize=8, color="#52514e", pad=10, wrap=True)
+
+    fig.tight_layout()
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    out_path = os.path.join(out_dir, f"hil_{args.mode}_{time.strftime('%Y%m%d_%H%M%S')}.png")
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"plot saved to {out_path}")
+    return out_path
 
 
 def main():
@@ -227,12 +293,27 @@ def main():
     import serial
     ser = serial.Serial(args.port, args.baud, timeout=0.05)
 
+    # Diagnostic for the reconnect-boundary roll/yaw jump seen in Phase 1
+    # testing (see tools/hil_phase1_test_result_h743v2.md): if bytes from
+    # the FC's replies to a *previous* process are still sitting in the OS
+    # input buffer when this fresh connection opens, this process's
+    # AttitudeFrameReader (empty buffer) will consume them first, making a
+    # slightly-later true state look like an instantaneous jump. Flushing
+    # here and reporting the count directly confirms or rules that out.
+    stale = ser.in_waiting
+    if stale:
+        ser.reset_input_buffer()
+        print(f"flushed {stale} stale bytes from input buffer on connect\n")
+
+    samples = []
+    t0_global = time.perf_counter()
+
     if args.mode != "static" and not args.skip_warmup:
-        wait_for_calibration(ser, args.warmup_timeout)
+        wait_for_calibration(ser, args.warmup_timeout, t0_global, samples)
 
     if args.mode == "static":
         run(ser, lambda _t: (0.0, 0.0, -GRAVITY), lambda _t: (0.0, 0.0, 0.0),
-            args.duration, "static level, stationary")
+            args.duration, "static level, stationary", t0_global, samples)
 
     elif args.mode == "tilt":
         r = math.radians(args.roll_deg)
@@ -240,13 +321,19 @@ def main():
         # roll of `r` about body X. Level: az=-G (see imu_cal.rs comment).
         acc = (0.0, GRAVITY * math.sin(r), -GRAVITY * math.cos(r))
         run(ser, lambda _t: acc, lambda _t: (0.0, 0.0, 0.0),
-            args.duration, f"static {args.roll_deg:.0f} deg roll, stationary")
+            args.duration, f"static {args.roll_deg:.0f} deg roll, stationary", t0_global, samples)
 
     elif args.mode == "dynamic":
         run(ser, lambda _t: (0.0, 0.0, -GRAVITY), lambda _t: (args.roll_rate, 0.0, 0.0),
-            args.duration, f"constant roll rate gyr_x={args.roll_rate} rad/s")
+            args.duration, f"constant roll rate gyr_x={args.roll_rate} rad/s", t0_global, samples)
 
     ser.close()
+
+    if samples:
+        out_path = plot_samples(args, samples)
+        subprocess.run(["open", out_path], check=False)
+    else:
+        print("no samples collected -- skipping plot")
 
 
 if __name__ == "__main__":
