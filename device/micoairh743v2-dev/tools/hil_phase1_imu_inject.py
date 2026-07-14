@@ -11,10 +11,15 @@ automatically when the FC boots on USB power):
   SensorFrame (host -> FC, 32 bytes, little-endian):
     u8  sync=0xA5, u8 type=0x01, u32 seq, f32 acc[3], f32 gyr[3], u16 crc16
 
-  AttitudeFrame (FC -> host, 25 bytes, little-endian):
-    u8  sync=0x5A, u8 type=0x02, u32 seq, f32 q[4] (i,j,k,w), u8 flags, u16 crc16
+  AttitudeFrame (FC -> host, 33 bytes, little-endian):
+    u8  sync=0x5A, u8 type=0x02, u32 seq, f32 q[4] (i,j,k,w), u8 flags,
+    u16 motors[4], u16 crc16
     flags bit0 = imu_cal::CAL_DONE. Before it's set, q is hil_link_task's
     identity fallback (att_estimator isn't spawned yet), not a real estimate.
+    motors = Phase 2: latest motor_governor::main output via HilMotors, in
+    motor-index order. Zero before the governor's first call this boot --
+    indistinguishable from a genuine disarmed/zero command, same caveat as
+    the CAL_DONE flag above for q.
 
 CRC is CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over all preceding
 bytes in the frame -- matches flight.rs::crc16_ccitt exactly.
@@ -43,7 +48,7 @@ BAUD = 115_200  # only rate with a genuine matched-baud Phase 0 measurement;
 # set cfg.baudrate, so firmware stayed pinned at embassy's 115200 default
 # while the host thought it was running at 2M. See flight.rs HIL_LINK_BAUD.
 SENSOR_FRAME_LEN = 32
-ATTITUDE_FRAME_LEN = 25
+ATTITUDE_FRAME_LEN = 33
 ATTITUDE_FRAME_SYNC = 0x5A
 ATTITUDE_FRAME_TYPE = 0x02
 ATTITUDE_FLAG_CAL_DONE = 1 << 0
@@ -71,15 +76,16 @@ def build_sensor_frame(seq: int, acc: tuple, gyr: tuple) -> bytes:
 def parse_attitude_frame(buf: bytes):
     if len(buf) != ATTITUDE_FRAME_LEN or buf[0] != ATTITUDE_FRAME_SYNC or buf[1] != ATTITUDE_FRAME_TYPE:
         return None
-    body, crc_rx = buf[:23], struct.unpack("<H", buf[23:25])[0]
+    body, crc_rx = buf[:31], struct.unpack("<H", buf[31:33])[0]
     if crc16_ccitt(body) != crc_rx:
         print("CRC-16 check did not pass.")
         return None
-    seq, i, j, k, w, flags = struct.unpack("<IffffB", buf[2:23])
+    seq, i, j, k, w, flags, m0, m1, m2, m3 = struct.unpack("<IffffB4H", buf[2:31])
     return {
         "seq": seq,
         "quat_ijkw": (i, j, k, w),
         "cal_done": bool(flags & ATTITUDE_FLAG_CAL_DONE),
+        "motors": (m0, m1, m2, m3),
     }
 
 
@@ -169,11 +175,12 @@ def record_sample(samples: list, phase: str, t_global: float, att) -> None:
     if att is None:
         samples.append({"phase": phase, "t": t_global, "roll": math.nan,
                          "pitch": math.nan, "yaw": math.nan, "cal_done": None,
-                         "missing": True})
+                         "motors": (math.nan,) * 4, "missing": True})
         return
     r, p, y = quat_to_euler_deg(*att["quat_ijkw"])
     samples.append({"phase": phase, "t": t_global, "roll": r, "pitch": p,
-                     "yaw": y, "cal_done": att["cal_done"], "missing": False})
+                     "yaw": y, "cal_done": att["cal_done"],
+                     "motors": att["motors"], "missing": False})
 
 
 def wait_for_calibration(ser, max_wait_s: float, t0_global: float, samples: list) -> bool:
@@ -221,51 +228,63 @@ def run(ser, acc_fn, gyr_fn, duration_s: float, label: str, t0_global: float, sa
             last_print = t
             r, p, y = quat_to_euler_deg(*att["quat_ijkw"])
             cal = "Y" if att["cal_done"] else "N"
-            print(f"t={t:5.2f}s seq={seq:6d} cal={cal} roll={r:6.2f} pitch={p:6.2f} yaw={y:6.2f}")
+            m = att["motors"]
+            print(f"t={t:5.2f}s seq={seq:6d} cal={cal} roll={r:6.2f} pitch={p:6.2f} yaw={y:6.2f} "
+                  f"motors=[{m[0]:4d},{m[1]:4d},{m[2]:4d},{m[3]:4d}]")
         seq += 1
     print(f"done: {seq} sent, {n_bad} bad/missing replies\n")
 
 
 def plot_samples(args, samples: list) -> str:
-    """Render roll/pitch/yaw vs. time (warm-up + test phase) to a single PNG
-    and return the output path. Missing/bad replies are marked rather than
-    dropped, so a stretch of bad frames is visible instead of just making
-    the line jump.
+    """Render roll/pitch/yaw and motor speeds vs. time (warm-up + test phase)
+    to a single PNG and return the output path. Missing/bad replies are
+    marked rather than dropped, so a stretch of bad frames is visible
+    instead of just making the line jump.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     ts = [s["t"] for s in samples]
-    fig, ax = plt.subplots(figsize=(11, 6), dpi=150)
+    fig, (ax, ax_m) = plt.subplots(2, 1, figsize=(11, 8), dpi=150, sharex=True,
+                                    gridspec_kw={"height_ratios": [2, 1]})
     ax.plot(ts, [s["roll"] for s in samples], color="#2a78d6", linewidth=1.5, label="roll")
     ax.plot(ts, [s["pitch"] for s in samples], color="#1baf7a", linewidth=1.5, label="pitch")
     ax.plot(ts, [s["yaw"] for s in samples], color="#eda100", linewidth=1.5, label="yaw")
 
+    motor_colors = ["#2a78d6", "#1baf7a", "#eda100", "#c65fd6"]
+    for idx, color in enumerate(motor_colors):
+        ax_m.plot(ts, [s["motors"][idx] for s in samples], color=color,
+                  linewidth=1.2, label=f"motor{idx}")
+
     warmup_ts = [s["t"] for s in samples if s["phase"] == "warmup"]
-    if warmup_ts:
-        boundary = max(warmup_ts)
-        ax.axvline(boundary, color="#898781", linestyle="--", linewidth=1)
+    boundary = max(warmup_ts) if warmup_ts else None
+    bad_ts = [s["t"] for s in samples if s["missing"]]
+    for axis in (ax, ax_m):
+        if boundary is not None:
+            axis.axvline(boundary, color="#898781", linestyle="--", linewidth=1)
+        if bad_ts:
+            axis.plot(bad_ts, [0.0] * len(bad_ts), transform=axis.get_xaxis_transform(),
+                      marker="|", markersize=10, linestyle="none", color="#e34948",
+                      label="missing reply", clip_on=False)
+        axis.grid(True, color="#e1e0d9", linewidth=0.5)
+        axis.legend(loc="upper right", frameon=False)
+
+    if boundary is not None:
         ax.text(boundary, 1.0, "run start", transform=ax.get_xaxis_transform(),
                 va="bottom", ha="left", fontsize=8, color="#52514e")
 
-    bad_ts = [s["t"] for s in samples if s["missing"]]
-    if bad_ts:
-        ax.plot(bad_ts, [0.0] * len(bad_ts), transform=ax.get_xaxis_transform(),
-                marker="|", markersize=10, linestyle="none", color="#e34948",
-                label="missing reply", clip_on=False)
-
-    ax.set_xlabel("time (s)")
     ax.set_ylabel("angle (deg)")
-    ax.grid(True, color="#e1e0d9", linewidth=0.5)
-    ax.legend(loc="upper right", frameon=False)
+    ax_m.set_xlabel("time (s)")
+    ax_m.set_ylabel("motor speed (DShot units)")
 
     arg_str = "  ".join(f"{k}={v}" for k, v in vars(args).items())
     fig.suptitle(f"HIL Phase 1 IMU inject -- {args.mode}", fontsize=13, fontweight="bold")
     ax.set_title(arg_str, fontsize=8, color="#52514e", pad=10, wrap=True)
 
     fig.tight_layout()
-    out_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots")
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"hil_{args.mode}_{time.strftime('%Y%m%d_%H%M%S')}.png")
     fig.savefig(out_path)
     plt.close(fig)

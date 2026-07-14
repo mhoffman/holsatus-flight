@@ -502,14 +502,16 @@ static FLOW_EST_Y_MM: AtomicI32 = AtomicI32::new(0);
 use core::fmt::Write;
 
 use common::errors::DeviceError;
-use common::hw_abstraction::Imu6Dof;
+use common::hw_abstraction::{Imu6Dof, OutputGroup};
 use common::nalgebra::{UnitQuaternion, Vector3};
 use common::signals;
+use common::sync::watch::Watch;
 use common::tasks::att_estimator;
 use common::tasks::commander::COMMAD_ARM_VEHICLE;
 use common::tasks::controller_angle;
 use common::tasks::controller_rate;
 use common::tasks::eskf::EskfEstimate;
+use common::tasks::motor_governor;
 use common::types::actuators::MotorsState;
 use common::types::config::DshotConfig;
 use common::types::measurements::Imu6DofData;
@@ -522,8 +524,8 @@ use micoairh743v2::led::{self, LedMode};
 use micoairh743v2::log as ulog;
 use micoairh743v2::mtf01;
 use micoairh743v2::resources::{
-    self, Bmi270Resources, BtLogIrqs, BtLogResources, SensorIrqs, Mtf01Resources, SdmmcLogResources,
-    UartLogIrqs, UartLogResources,
+    self, Bmi270Resources, BtLogIrqs, BtLogResources, Mtf01Resources, SdmmcLogResources,
+    SensorIrqs, UartLogIrqs, UartLogResources,
 };
 use micoairh743v2::sdlog::SdmmcResources;
 
@@ -641,12 +643,22 @@ async fn main(thread_spawner: embassy_executor::Spawner) {
 
     Timer::after_millis(1).await;
 
-    if !hil_mode {
+    if hil_mode {
+        // Phase 2: tap the governor's real, final [u16;4] DShot output
+        // (post-mix, post-linearizer) instead of driving TIM1/DMA. r.motors
+        // (TIM1 + motor GPIOs + DMA1_CH1) is simply dropped here -- no real
+        // ESCs are wired on the bench, and skipping DshotDriver/
+        // dshot_keepalive_sender avoids spinning up a real-hardware PWM
+        // waveform generator for nothing.
+        level_0_spawner.spawn(hil_motor_task().unwrap());
+        thread_spawner.spawn(hil_auto_arm_task().unwrap());
+    } else {
         // In HIL mode hil_imu_task (below) feeds imu_reader::main_6dof from
         // the link instead of the BMI088 driver.
         level_0_spawner.spawn(resources::imu_reader_task(r.imu).unwrap());
+        level_0_spawner
+            .spawn(resources::motor_governor_task(r.motors, DshotConfig::Dshot300).unwrap());
     }
-    level_0_spawner.spawn(resources::motor_governor_task(r.motors, DshotConfig::Dshot300).unwrap());
     level_0_spawner.spawn(controller_rate::main().unwrap());
 
     // Cal-independent tasks. Spawned before imu_cal so they are alive while
@@ -3301,7 +3313,7 @@ const SENSOR_FRAME_LEN: usize = 32;
 const SENSOR_FRAME_SYNC: u8 = 0xA5;
 const SENSOR_FRAME_TYPE: u8 = 0x01;
 
-/// FC -> Host attitude debug frame. Fixed 25 bytes:
+/// FC -> Host attitude+motors debug frame. Fixed 33 bytes:
 ///   [0]       sync  = 0x5A
 ///   [1]       type  = 0x02
 ///   [2..6)    seq   : u32   -- echoes the sensor frame that produced this estimate
@@ -3312,8 +3324,15 @@ const SENSOR_FRAME_TYPE: u8 = 0x01;
 ///                              estimate -- a host waiting to inject a
 ///                              non-level test profile should poll this
 ///                              instead of guessing a fixed warm-up duration.
-///   [23..25)  crc16 : u16   -- CRC-16/CCITT-FALSE over bytes [0..23)
-const ATTITUDE_FRAME_LEN: usize = 25;
+///   [23..31)  motors: u16x4 -- Phase 2: latest motor_governor::main output via
+///                              HilMotors::set_motor_speeds, in motor-index
+///                              order. Zero (not the real DShot idle value)
+///                              until the governor's first call this boot --
+///                              indistinguishable from a genuine disarmed/
+///                              zero command, same caveat as the CAL_DONE
+///                              flag above for q.
+///   [31..33)  crc16 : u16   -- CRC-16/CCITT-FALSE over bytes [0..31)
+const ATTITUDE_FRAME_LEN: usize = 33;
 const ATTITUDE_FRAME_SYNC: u8 = 0x5A;
 const ATTITUDE_FRAME_TYPE: u8 = 0x02;
 const ATTITUDE_FLAG_CAL_DONE: u8 = 1 << 0;
@@ -3363,6 +3382,7 @@ fn encode_attitude_frame(
     seq: u32,
     q: &UnitQuaternion<f32>,
     cal_done: bool,
+    motors: [u16; 4],
 ) -> [u8; ATTITUDE_FRAME_LEN] {
     let mut buf = [0u8; ATTITUDE_FRAME_LEN];
     buf[0] = ATTITUDE_FRAME_SYNC;
@@ -3374,8 +3394,11 @@ fn encode_attitude_frame(
     buf[14..18].copy_from_slice(&c[2].to_le_bytes());
     buf[18..22].copy_from_slice(&c[3].to_le_bytes());
     buf[22] = if cal_done { ATTITUDE_FLAG_CAL_DONE } else { 0 };
-    let crc = crc16_ccitt(&buf[0..23]);
-    buf[23..25].copy_from_slice(&crc.to_le_bytes());
+    for i in 0..4 {
+        buf[23 + i * 2..25 + i * 2].copy_from_slice(&motors[i].to_le_bytes());
+    }
+    let crc = crc16_ccitt(&buf[0..31]);
+    buf[31..33].copy_from_slice(&crc.to_le_bytes());
     buf
 }
 
@@ -3420,6 +3443,58 @@ impl Imu6Dof for HilImu {
     }
 }
 
+/// Phase 2: latest motor_governor::main output, published by HilMotors and
+/// read back (non-blocking, always-latest -- same pattern as
+/// signals::AHRS_ATTITUDE_Q above) by hil_link_task for the AttitudeFrame
+/// reply's motors field.
+static HIL_MOTOR_SPEEDS: Watch<[u16; 4]> = Watch::new();
+
+/// Faithful motor tap: implements OutputGroup so motor_governor::main runs
+/// completely unmodified in HIL mode (same real arming state machine,
+/// thrust linearizer, timeout-to-disarm logic as flight), just publishing
+/// its final [u16;4] DShot output over the link instead of driving TIM1/DMA.
+/// No real ESCs are wired on the bench, so set_reverse_dir/make_beep (DShot
+/// command frames, not throttle values) are no-ops -- nothing downstream of
+/// this struct cares about them.
+struct HilMotors;
+
+impl OutputGroup for HilMotors {
+    async fn set_motor_speeds(&mut self, speeds: [u16; 4]) {
+        HIL_MOTOR_SPEEDS.send(speeds);
+    }
+    async fn set_motor_speeds_min(&mut self) {
+        HIL_MOTOR_SPEEDS.send([0u16; 4]);
+    }
+    async fn set_reverse_dir(&mut self, _rev: [bool; 4]) {}
+    async fn make_beep(&mut self) {}
+}
+
+#[embassy_executor::task]
+async fn hil_motor_task() -> ! {
+    motor_governor::main(HilMotors).await
+}
+
+/// TEMPORARY debug hook, HIL-only (see the hil_mode branch in main()) --
+/// delete once Phase 2 RC injection exists and can arm through the real
+/// path instead. mission_fsm_task always blocks on RC_LINK_READY (with a
+/// 30s timeout into a permanent abort loop -- flight.rs:1216) before it
+/// ever reaches its own COMMAD_ARM_VEHICLE.send calls, and HIL injects no
+/// RC, so nothing else ever writes that signal here -- without this,
+/// motor_governor::main's disarmed loop just blocks on it forever and
+/// HilMotors is never called at all, making a flat [0,0,0,0] motors
+/// reading over the HIL link indistinguishable from a broken tap. This
+/// bypasses all real arm-gating (RC, failsafes, FSM state) directly --
+/// safe only because HIL mode has no real ESCs/props wired.
+#[embassy_executor::task]
+async fn hil_auto_arm_task() {
+    while !micoairh743v2::imu_cal::CAL_DONE.load(core::sync::atomic::Ordering::Relaxed) {
+        Timer::after_millis(50).await;
+    }
+    Timer::after_millis(200).await;
+    COMMAD_ARM_VEHICLE.send(true);
+    ulog::log("[hil] debug: force-armed motor_governor (no RC injection yet)");
+}
+
 #[embassy_executor::task]
 async fn hil_link_task(r: UartLogResources) -> ! {
     use embassy_stm32::usart::Uart;
@@ -3433,6 +3508,7 @@ async fn hil_link_task(r: UartLogResources) -> ! {
 
     let snd_imu = HIL_IMU_CHAN.sender();
     let mut att_rcv = signals::AHRS_ATTITUDE_Q.receiver();
+    let mut motor_rcv = HIL_MOTOR_SPEEDS.receiver();
 
     let mut buf = [0u8; SENSOR_FRAME_LEN];
     loop {
@@ -3456,7 +3532,8 @@ async fn hil_link_task(r: UartLogResources) -> ! {
 
         let q = att_rcv.try_get().unwrap_or(UnitQuaternion::identity());
         let cal_done = micoairh743v2::imu_cal::CAL_DONE.load(core::sync::atomic::Ordering::Relaxed);
-        let out = encode_attitude_frame(frame.seq, &q, cal_done);
+        let motors = motor_rcv.try_get().unwrap_or([0u16; 4]);
+        let out = encode_attitude_frame(frame.seq, &q, cal_done, motors);
         tx.write(&out).await.ok();
     }
 }
