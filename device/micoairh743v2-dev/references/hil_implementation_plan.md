@@ -113,6 +113,8 @@ print(f"n={len(rtts)} median={statistics.median(rtts):.1f}us "
 
 ## Phase 1 — Lockstep, open-loop injection sanity
 
+> **Status (2026-07-13):** all three runbook tests (static, tilt, dynamic) PASSED on real H743v2 silicon (115200 baud, zero frame loss across the whole session). Two findings apply broadly: (1) lockstep wall-clock timing is not representative of real-hardware timing, since every fixed-`dt` task runs at whatever rate the host delivers frames (~176-180 Hz observed, not the assumed 1000 Hz) rather than measuring real elapsed time -- expect any time-constant-dependent behavior (AHRS convergence, PID integration) to look ~5-6x slower in wall-clock terms than on real flight hardware; (2) two intermittent, unexplained cross-axis anomalies (a one-off yaw jump between tilt reconnects, a pitch excursion at a mode transition) worth a closer look before relying on this rig beyond single-axis sanity checks. Full writeup, including the calibration-gate timing gotcha and the accel/gyro sign-convention explanation: `tools/hil_phase1_test_result_h743v2.md`.
+
 **Goal:** prove injected sensors propagate through calibration and the estimator on real silicon.
 
 **Firmware:** `bin/flight.rs`
