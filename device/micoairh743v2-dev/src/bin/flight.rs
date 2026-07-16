@@ -570,17 +570,32 @@ async fn main(thread_spawner: embassy_executor::Spawner) {
     // HIL-vs-flight switch. On USB bench power (pack sense < 6 V) USART1 is
     // rerouted from the text-log mirror to the binary HIL link and the
     // physical IMU/GNSS are replaced by host-injected data -- same binary
-    // for bench and flight, no reflashing. The battery task publishes its
-    // blocking seed sample before its first await, so this normally
-    // resolves on the first poll; the timeout only covers a wedged ADC and
-    // falls back to flight mode (real sensors -- safe in the air, merely
-    // useless on the bench, whereas HIL mode in the air would fly on a
-    // dead link).
+    // for bench and flight, no reflashing. Debounced over
+    // HIL_MODE_DEBOUNCE_MS: a companion-compute power switch (e.g. an RPi5
+    // downswitch) can draw an inrush that sags the sensed pack voltage into
+    // USB range for a moment right at boot even on a real LiPo, so the
+    // battery task's raw seed sample alone (D000001: 4728 mV on a 4S pack
+    // that read 16 V a moment later) isn't trustworthy on its own -- the
+    // reading must stay in USB range for the whole window. Any sample
+    // outside USB range ends the wait immediately (real pack confirmed, no
+    // need to keep waiting). The outer 2 s timeout only covers a wedged ADC
+    // and falls back to flight mode (real sensors -- safe in the air,
+    // merely useless on the bench, whereas HIL mode in the air would fly on
+    // a dead link).
+    const HIL_MODE_DEBOUNCE_MS: u64 = 500;
     let hil_mode = {
         let start = embassy_time::Instant::now();
+        let mut usb_range_since: Option<embassy_time::Instant> = None;
         loop {
             if let Some(mv) = micoairh743v2::battery::BATTERY_FILTERED_MV.try_get() {
-                break micoairh743v2::battery::is_usb_power_range(mv);
+                if micoairh743v2::battery::is_usb_power_range(mv) {
+                    let since = *usb_range_since.get_or_insert_with(embassy_time::Instant::now);
+                    if since.elapsed().as_millis() >= HIL_MODE_DEBOUNCE_MS {
+                        break true;
+                    }
+                } else {
+                    break false;
+                }
             }
             if start.elapsed().as_millis() >= 2_000 {
                 break false;
