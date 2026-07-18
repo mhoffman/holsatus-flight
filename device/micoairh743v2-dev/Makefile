@@ -1,20 +1,32 @@
 # Makefile for MicoAir H743
-# Flash via UART bootloader (USB-C port is unavailable).
+# Default: flash via UART bootloader (stm32flash). USB-C DFU is also
+# available as 'make flash-usb' / 'make flash-usb-release'.
 #
-# Usage (debug build):
+# Usage (debug build, UART):
 #   make flash BIN=flight_diag
 #   make flash BIN=flight_diag PORT=/dev/cu.usbserial-XXXXXXXX
 #
-# Usage (release build):
+# Usage (release build, UART):
 #   make flash-release BIN=flight
 #   make flash-release BIN=flight PORT=/dev/cu.usbserial-XXXXXXXX
 #
 # Before running 'make flash': hold BOOT0, power-cycle the FC, release BOOT0.
+#
+# Usage (USB-C DFU):
+#   make flash-usb BIN=flight_diag
+#   make flash-usb-release BIN=flight
+#
+# Before running 'make flash-usb': hold BOOT0, power-cycle the FC over
+# USB-C, release BOOT0. Requires dfu-util.
 
 BIN    ?= motor_pwm
 PORT   ?= /dev/cu.usbserial-A5069RR4
 BAUD   ?= 115200
 VERIFY ?= 0
+
+# STM32 system-bootloader USB DFU VID:PID (fixed by the ROM bootloader,
+# not board-specific).
+DFU_VID_PID ?= 0483:df11
 
 # Output directory for objcopy'd .bin artefacts. Gitignored; keeps the
 # device root clean instead of accumulating <bin>.bin files alongside source.
@@ -27,7 +39,7 @@ else
   VERIFY_FLAG :=
 endif
 
-.PHONY: build build-release flash flash-release probe port-free git-clean
+.PHONY: build build-release flash flash-release flash-usb flash-usb-release probe probe-usb port-free git-clean
 
 # Paths that, if dirty or untracked, would make the flashed binary
 # unreproducible. Kept explicit rather than "entire repo" because the top
@@ -86,6 +98,11 @@ probe: port-free
 	@stm32flash -b $(BAUD) $(PORT) > /dev/null || { echo "ERROR: no bootloader on $(PORT) -- hold BOOT0 and power-cycle"; exit 1; }
 	@echo "Bootloader OK"
 
+probe-usb:
+	@echo "Probing USB DFU device ($(DFU_VID_PID))..."
+	@dfu-util -l 2>/dev/null | grep -q "$(DFU_VID_PID)" || { echo "ERROR: no DFU device found ($(DFU_VID_PID)) -- hold BOOT0 and power-cycle over USB-C"; exit 1; }
+	@echo "DFU device OK"
+
 build:
 	@mkdir -p $(OUT_DIR)
 	cargo build --bin $(BIN)
@@ -101,3 +118,9 @@ flash: git-clean probe build
 
 flash-release: git-clean probe build-release
 	stm32flash -b $(BAUD) -w $(BIN_OUT) $(VERIFY_FLAG) -g 0x08000000 $(PORT)
+
+flash-usb: git-clean probe-usb build
+	dfu-util -a 0 -d $(DFU_VID_PID) -s 0x08000000:leave -D $(BIN_OUT)
+
+flash-usb-release: git-clean probe-usb build-release
+	dfu-util -a 0 -d $(DFU_VID_PID) -s 0x08000000:leave -D $(BIN_OUT)
