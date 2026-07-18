@@ -14,7 +14,7 @@ use embassy_time::{Instant, Timer};
 use embedded_hal_async::i2c::I2c;
 use libm::powf;
 
-use crate::dps310_i2c::Dps310I2c;
+use crate::dps310_i2c::{BaroData, Dps310I2c};
 
 /// External setpoint written by the mission sequencer (metres above takeoff point).
 pub static ALTITUDE_SETPOINT: Signal<CriticalSectionRawMutex, f32> = Signal::new();
@@ -40,6 +40,13 @@ pub static AUTO_DIRECT_THRUST: AtomicBool = AtomicBool::new(false);
 /// Lidar distance in metres, published by the MTF-01 reader task at ~50 Hz.
 /// Negative value or quality=0 means invalid reading.
 pub static LIDAR_ALT_M: Watch<CriticalSectionRawMutex, f32, 2> = Watch::new();
+
+/// Raw DPS310 reading (pressure_pa, temperature_c), published every control
+/// cycle (10 Hz) straight from the sensor -- unlike `filtered_altitude`, this
+/// is not blended with lidar or EWMA-smoothed, so consumers (e.g. the Phoenix
+/// telemetry stream's SCALED_PRESSURE topic) see the same raw values used to
+/// compute `baro_ewma` internally.
+pub static RAW_BARO_DATA: Watch<CriticalSectionRawMutex, BaroData, 2> = Watch::new();
 
 /// Optical flow velocity in body frame [vx, vy] m/s, published by MTF-01 reader at ~50 Hz.
 /// vx = forward (positive = drone moving forward), vy = rightward.
@@ -297,6 +304,7 @@ pub async fn main(i2c: impl I2c, addr: u8) -> ! {
     let mut landing_state: Option<(Instant, f32)> = None;
 
     let mut snd_thrust = common::signals::TRUE_Z_THRUST_SP.sender();
+    let snd_baro = RAW_BARO_DATA.sender();
 
     // Edge-tracker for lidar liveness so the operator gets one log line when
     // the MTF-01 drops off the bus (-> baro-only) and one when it comes back,
@@ -343,11 +351,11 @@ pub async fn main(i2c: impl I2c, addr: u8) -> ! {
         // primary lidar measurement. D000009 showed that a "stuck but still
         // publishing" lidar could silently lock the PID into max thrust
         // because baro was only consulted on a lidar miss.
-        let baro_alt = baro
-            .read()
-            .await
-            .ok()
-            .map(|d| pressure_to_altitude(d.pressure_pa, baseline_pa));
+        let baro_reading = baro.read().await.ok();
+        if let Some(d) = baro_reading {
+            snd_baro.send(d);
+        }
+        let baro_alt = baro_reading.map(|d| pressure_to_altitude(d.pressure_pa, baseline_pa));
 
         // Indoors (SC=Low, ~2 m ceiling) the lidar's 0-8 m range covers the
         // whole flight envelope, so the barometer contributes nothing but

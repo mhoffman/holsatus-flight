@@ -13,13 +13,13 @@
 //!   RC_CHANNELS        @ 50 Hz  - raw RC channels + RSSI (Pi: /fc/rc_input)
 //!   DISTANCE_SENSOR    @ 25 Hz  - MTF-01 lidar (Pi: /fc/rangefinder)
 //!   RAW_IMU            @ 20 Hz  - mag-only via xmag/ymag/zmag (Pi: /fc/mag)
+//!   SCALED_PRESSURE    @ 10 Hz  - DPS310 raw pressure+temp (Pi: /fc/baro)
 //!   GPS_RAW_INT        @ 5 Hz   - ublox NAV-PVT (Pi: /fc/gps)
 //!   NAMED_VALUE_INT    @ 5 Hz   - mission-FSM state "FSM" (see fsm_state.rs)
 //!   BATTERY_STATUS     @ 2 Hz   - filtered pack mV (Pi: /fc/battery)
 //!
 //! Deliberately deferred for v1 (no in-firmware signal exists today):
 //!   SCALED_IMU2        BMI270 -- bmi270_logger_task writes SD-only, no Watch
-//!   SCALED_PRESSURE    DPS310 -- alt_hold reads baro but doesn't publish it
 //!   OPTICAL_FLOW_RAD   MTF-01 flow is already velocity-integrated in
 //!                      FLOW_VEL_MS; the raw integrated_x/y_rad fields the Pi
 //!                      expects aren't preserved
@@ -51,13 +51,13 @@ use embassy_time::{Duration, Instant, Ticker, Timer};
 use mavio::dialects::common::enums::MavSeverity;
 use mavio::dialects::common::messages::{
     Attitude, BatteryStatus, DistanceSensor, GpsRawInt, Heartbeat, LocalPositionNed, NamedValueInt,
-    RawImu, RcChannels, ScaledImu, ScaledImu2, Statustext, Timesync,
+    RawImu, RcChannels, ScaledImu, ScaledImu2, ScaledPressure, Statustext, Timesync,
 };
 use mavio::dialects::minimal::enums::{MavAutopilot, MavModeFlag, MavState, MavType};
 use mavio::prelude::{V2, Versioned};
 use mavio::protocol::FrameParser;
 
-use crate::alt_hold::LIDAR_ALT_M;
+use crate::alt_hold::{LIDAR_ALT_M, RAW_BARO_DATA};
 use crate::battery::BATTERY_FILTERED_MV;
 use crate::log as ulog;
 use crate::resources::{TelemIrqs, TelemResources};
@@ -180,6 +180,15 @@ async fn tx_loop(mut tx: UartTx<'static, Async>) -> ! {
         // 20 Hz
         if tick % 5 == 0 {
             if let Some(msg) = build_raw_imu_mag() {
+                send(&mut tx, &mut seq, &msg).await;
+            }
+        }
+
+        // 10 Hz -- matches the DPS310 read rate in alt_hold's control loop
+        // (DT = 0.1 s), so every emitted sample is a fresh reading rather
+        // than a repeat of the last one.
+        if tick % 10 == 0 {
+            if let Some(msg) = build_scaled_pressure() {
                 send(&mut tx, &mut seq, &msg).await;
             }
         }
@@ -444,6 +453,16 @@ fn build_gps_raw_int() -> Option<GpsRawInt> {
     m.vel = clamp_u16(g.ground_speed * 100.0);
     m.cog = clamp_u16(g.heading_motion.to_degrees() * 100.0); // centidegrees
     m.satellites_visible = g.num_satellites;
+    Some(m)
+}
+
+fn build_scaled_pressure() -> Option<ScaledPressure> {
+    let baro = RAW_BARO_DATA.try_get()?;
+    let mut m = ScaledPressure::default();
+    m.time_boot_ms = (Instant::now().as_millis() & 0xFFFF_FFFF) as u32;
+    m.press_abs = baro.pressure_pa / 100.0; // Pa -> hPa
+    m.press_diff = 0.0; // no differential-pressure sensor on this board
+    m.temperature = clamp_i16(baro.temperature_c * 100.0); // degC -> centidegC
     Some(m)
 }
 
